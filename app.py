@@ -1,219 +1,192 @@
-import io
-import numpy as np
-import pandas as pd
+# app.py
 import streamlit as st
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
 
-st.set_page_config(page_title="Cement Bogue Calculator", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Raw Mix Optimizer (No Cost)", layout="wide")
+st.title("Raw Mix Optimizer — Cost Removed (LSF / SM / AM targets)")
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def bogue_from_oxides(row, method="classic", clip_negatives=True, renormalize=False):
-    """
-    Compute Bogue phases (mass %) from oxide composition (mass %).
-    Expected columns (case-insensitive): SiO2, Al2O3, Fe2O3, CaO, SO3 (optional), Na2O (opt), K2O (opt).
-    Methods:
-      - "classic": classic Bogue without CaO correction for sulfate/alkali
-      - "so3_corrected": CaO' = CaO - 0.7 * SO3
-      - "so3_alkali_corrected": CaO' = CaO - 0.7 * SO3 - 0.35 * (Na2O + K2O)
-        (simple practical adjustment; yes, purists can fight me later)
-    """
-    # Pull with safe defaults
-    s = lambda k: float(row.get(k, row.get(k.lower(), 0.0)) or 0.0)
-    SiO2  = s("SiO2")
-    Al2O3 = s("Al2O3")
-    Fe2O3 = s("Fe2O3")
-    CaO   = s("CaO")
-    SO3   = s("SO3")
-    Na2O  = s("Na2O")
-    K2O   = s("K2O")
+st.markdown("""
+This app finds material ratios (sum = 100%) for up to 6 materials to best match target:
+- LSF = 100 * CaO / (2.8*SiO2 + 1.18*Al2O3 + 0.65*Fe2O3)
+- SM  = SiO2 / (Al2O3 + Fe2O3)
+- AM  = Al2O3 / Fe2O3
 
-    # CaO correction options commonly used in plants
-    if method == "classic":
-        CaO_corr = CaO
-    elif method == "so3_corrected":
-        CaO_corr = CaO - 0.70 * SO3
-    elif method == "so3_alkali_corrected":
-        CaO_corr = CaO - 0.70 * SO3 - 0.35 * (Na2O + K2O)
-    else:
-        CaO_corr = CaO  # fallback, because humans
+I use a nonlinear optimizer (SLSQP) to minimize squared deviation from targets.
+""")
 
-    # Classic Bogue equations (OPC assumptions, low SCMs)
-    C4AF = 3.043 * Fe2O3
-    C3A  = 2.650 * Al2O3 - 1.692 * Fe2O3
-    C3S  = 4.071 * CaO_corr - 7.600 * SiO2 - 6.718 * Al2O3 - 1.430 * Fe2O3
-    C2S  = 2.867 * SiO2 - 0.7544 * C3S
-
-    phases = pd.Series({"C3S": C3S, "C2S": C2S, "C3A": C3A, "C4AF": C4AF}, dtype=float)
-
-    if clip_negatives:
-        phases = phases.clip(lower=0)
-
-    if renormalize:
-        total = phases.sum()
-        if total > 0:
-            phases = phases * (100.0 / total)
-
-    return phases
-
-def validate_total_oxides(total, warn_threshold=100.0, hard_threshold=120.0):
-    if total <= 0:
-        return "Nope. Your oxide total is zero or negative. Try again."
-    if total > hard_threshold:
-        return f"Oxides total {total:.1f}% is not realistic. Check your units and decimals."
-    if abs(total - warn_threshold) > 5:
-        return f"Heads up: oxides total {total:.1f}% is far from ~100%. If there’s LOI/moisture/SCMs, fine; otherwise recheck."
-    return None
-
-# -----------------------------
-# UI
-# -----------------------------
-st.title("🧪 Bogue Calculator for Cement Clinker")
-st.caption("Give me oxides, get phases. Fair trade.")
-
-with st.sidebar:
-    st.header("Input options")
-    method = st.selectbox(
-        "Calculation mode",
-        [
-            "classic",
-            "so3_corrected",
-            "so3_alkali_corrected",
-        ],
-        index=1,
-        help=(
-            "classic: no CaO correction\n"
-            "so3_corrected: CaO' = CaO - 0.70·SO3\n"
-            "so3_alkali_corrected: CaO' = CaO - 0.70·SO3 - 0.35·(Na2O+K2O)"
-        ),
-    )
-    clip_neg = st.toggle("Clip negatives to 0", value=True)
-    renorm = st.toggle("Renormalize phases to 100%", value=False)
-
-    st.divider()
-    st.write("Batch mode (CSV)")
-    csv_file = st.file_uploader(
-        "Upload CSV with columns: CaO, SiO2, Al2O3, Fe2O3, SO3, Na2O, K2O",
-        type=["csv"],
-        accept_multiple_files=False,
-    )
-    st.caption("I’ll ignore extra columns like LOI, MgO, TiO2. I’m generous like that.")
-
-# -----------------------------
-# Single-sample inputs
-# -----------------------------
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    CaO = st.number_input("CaO %", value=65.0, min_value=0.0, max_value=100.0, step=0.1)
-    Al2O3 = st.number_input("Al₂O₃ %", value=4.8, min_value=0.0, max_value=100.0, step=0.1)
-with col2:
-    SiO2 = st.number_input("SiO₂ %", value=21.0, min_value=0.0, max_value=100.0, step=0.1)
-    Fe2O3 = st.number_input("Fe₂O₃ %", value=3.2, min_value=0.0, max_value=100.0, step=0.1)
-with col3:
-    SO3 = st.number_input("SO₃ %", value=1.5, min_value=0.0, max_value=10.0, step=0.1)
-    Na2O = st.number_input("Na₂O %", value=0.2, min_value=0.0, max_value=5.0, step=0.01)
-with col4:
-    K2O = st.number_input("K₂O %", value=0.6, min_value=0.0, max_value=5.0, step=0.01)
-    LOI = st.number_input("LOI % (optional)", value=0.0, min_value=0.0, max_value=30.0, step=0.1)
-
-inputs = {
-    "CaO": CaO,
-    "SiO2": SiO2,
-    "Al2O3": Al2O3,
-    "Fe2O3": Fe2O3,
-    "SO3": SO3,
-    "Na2O": Na2O,
-    "K2O": K2O,
-    "LOI": LOI,
+# --- Default materials (example realistic oxide % for demo) ---
+default_materials = {
+    "Material 1 (Limestone)": {"CaO": 54.0, "SiO2": 3.0, "Al2O3": 0.5, "Fe2O3": 0.2, "MgO": 1.0, "K2O":0.05, "Na2O":0.03, "SO3":0.02},
+    "Material 2 (Shale/Clay)":  {"CaO": 2.0,  "SiO2": 55.0,"Al2O3": 20.0,"Fe2O3": 6.0, "MgO": 1.5, "K2O":0.8, "Na2O":0.1, "SO3":0.5},
+    "Material 3 (Iron Ore/Red Mud)": {"CaO": 1.0, "SiO2": 10.0,"Al2O3": 4.0, "Fe2O3": 70.0,"MgO": 0.5, "K2O":0.02, "Na2O":0.01, "SO3":0.1},
+    "Material 4 (Silica Sand)": {"CaO": 0.5, "SiO2": 96.0,"Al2O3": 0.5, "Fe2O3": 0.2, "MgO": 0.02, "K2O":0.01, "Na2O":0.01, "SO3":0.01},
+    "Material 5 (Slag/Fly ash)": {"CaO": 40.0,"SiO2": 30.0,"Al2O3": 8.0, "Fe2O3": 1.5, "MgO": 8.0, "K2O":0.3, "Na2O":0.1, "SO3":1.0},
+    "Material 6 (Dolomite/Other)": {"CaO": 30.0,"SiO2": 10.0,"Al2O3": 2.0, "Fe2O3": 0.5, "MgO": 18.0,"K2O":0.02,"Na2O":0.01,"SO3":0.02},
 }
-total_ox = CaO + SiO2 + Al2O3 + Fe2O3 + SO3 + Na2O + K2O
-msg = validate_total_oxides(total_ox)
-if msg:
-    st.info(msg)
 
-# -----------------------------
-# Single result
-# -----------------------------
-phases = bogue_from_oxides(inputs, method=method, clip_negatives=clip_neg, renormalize=renorm)
-res_df = pd.DataFrame(phases, columns=["%"]).T.round(2)
+st.sidebar.header("General settings")
+n_materials = st.sidebar.slider("Number of materials to use", min_value=2, max_value=6, value=4)
 
-left, right = st.columns([1, 1])
-with left:
-    st.subheader("Single Sample Result")
-    st.dataframe(res_df, use_container_width=True)
-with right:
-    st.subheader("Phase Distribution")
-    st.bar_chart(phases.rename("Phase %"))
+materials = [f"Material {i+1}" for i in range(n_materials)]
 
-st.caption(
-    "Formulas: C₄AF=3.043·Fe₂O₃; C₃A=2.650·Al₂O₃−1.692·Fe₂O₃; "
-    "C₃S=4.071·CaO'−7.600·SiO₂−6.718·Al₂O₃−1.430·Fe₂O₃; "
-    "C₂S=2.867·SiO₂−0.7544·C₃S. Assumes OPC with low SCMs."
-)
+# Build input table with prefilled realistic defaults (first N)
+oxide_cols = ["CaO","SiO2","Al2O3","Fe2O3","MgO","K2O","Na2O","SO3"]
+input_table = pd.DataFrame(index=oxide_cols, columns=materials, dtype=float)
 
-# -----------------------------
-# Batch mode (CSV)
-# -----------------------------
-st.divider()
-st.header("Batch Calculator (CSV)")
-sample_note = st.expander("Sample CSV format (copy/paste)")
-with sample_note:
-    st.code(
-        "SampleID,CaO,SiO2,Al2O3,Fe2O3,SO3,Na2O,K2O\n"
-        "K1,65.0,21.0,4.8,3.2,1.5,0.2,0.6\n"
-        "K2,64.5,21.5,5.0,3.0,1.2,0.25,0.55\n",
-        language="text",
-    )
+# Pre-fill with defaults for convenience
+for i, mat in enumerate(materials):
+    key = list(default_materials.keys())[i]
+    for ox in oxide_cols:
+        input_table.loc[ox, mat] = default_materials[key].get(ox, 0.0)
 
-if csv_file is not None:
-    try:
-        df_in = pd.read_csv(csv_file)
-        # Keep columns of interest case-insensitively
-        cols_map = {}
-        wanted = ["SampleID","CaO","SiO2","Al2O3","Fe2O3","SO3","Na2O","K2O"]
-        for c in df_in.columns:
-            cl = c.strip()
-            for w in wanted:
-                if cl.lower() == w.lower() and w not in cols_map.values():
-                    cols_map[c] = w
-                    break
-        df = df_in.rename(columns=cols_map)
+st.subheader("Oxide compositions for each material (%) — edit as needed")
+# <<< FIX: use stable data editor API >>>
+edited = st.data_editor(input_table, num_rows="dynamic")
 
-        # Build outputs
-        out_rows = []
-        for i, row in df.iterrows():
-            phases_i = bogue_from_oxides(row, method=method, clip_negatives=clip_neg, renormalize=renorm)
-            out_rows.append(phases_i)
+# Validate edited table and replace missing values with 0
+try:
+    # convert to numeric and fill NaN with 0.0
+    edited = edited.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+except Exception:
+    # If user changed the table structure (like renaming columns), rebuild minimal safe matrix
+    st.warning("Input table had unexpected structure. Rebuilding from defaults.")
+    edited = input_table.copy()
 
-        out_df = pd.DataFrame(out_rows)
-        # Prepend SampleID if present
-        if "SampleID" in df.columns or "SampleID" in df.rename(columns=str).columns:
-            sid = df.get("SampleID", df.get("sampleid", pd.Series(np.arange(len(df)))))
-            out_df.insert(0, "SampleID", sid)
+st.sidebar.header("Target & tolerances")
+target_lsf = st.sidebar.number_input("Target LSF", value=98.0, step=0.1, format="%.2f")
+target_sm  = st.sidebar.number_input("Target SM", value=2.5, step=0.01, format="%.2f")
+target_am  = st.sidebar.number_input("Target AM", value=1.6, step=0.01, format="%.2f")
 
-        out_df = out_df.round(2)
-        st.success(f"Processed {len(out_df)} samples.")
-        st.dataframe(out_df, use_container_width=True)
+st.sidebar.markdown("**Optional: tolerances (used only for displaying recommended acceptance)**")
+tol_lsf = st.sidebar.number_input("LSF tolerance (±)", value=1.0, step=0.1, format="%.2f")
+tol_sm  = st.sidebar.number_input("SM tolerance (±)", value=0.05, step=0.01, format="%.2f")
+tol_am  = st.sidebar.number_input("AM tolerance (±)", value=0.05, step=0.01, format="%.2f")
 
-        # Download
-        csv_buf = io.StringIO()
-        out_df.to_csv(csv_buf, index=False)
-        st.download_button(
-            "Download results as CSV",
-            data=csv_buf.getvalue().encode("utf-8"),
-            file_name="bogue_results.csv",
-            mime="text/csv",
-        )
-    except Exception as e:
-        st.error(f"Could not process CSV: {e}")
+st.markdown("### Initial guess (equal split). You can adjust initial guess for solver below.")
+# Initial guess vector (equal split)
+x0 = np.array([100.0 / n_materials] * n_materials)
 
-# -----------------------------
-# Footer
-# -----------------------------
-st.markdown(
-    """
-**Notes**
-- These are theoretical phase estimates. Real clinker laughs at theory when burning conditions, minor oxides, and cooling rates get involved.
-- If you’re using high SCMs or special cements, use with caution or give me a different model to babysit.
-"""
-)
+# Convert dataframe to numpy arrays (safe)
+try:
+    oxide_matrix = np.array([[float(edited.loc[ox, mat]) for mat in materials] for ox in oxide_cols])  # shape (8, n)
+except Exception:
+    # fallback to input_table if indexing failed
+    oxide_matrix = np.array([[float(input_table.loc[ox, mat]) for mat in materials] for ox in oxide_cols])
+oxide_matrix = oxide_matrix.astype(float)
+
+# Helper: compute mix oxides (percent)
+def mix_oxides(x):
+    # x in percentages summing to 100
+    w = np.array(x) / 100.0  # fractions
+    mix = oxide_matrix.dot(w)  # weighted average composition (%)
+    return mix  # array length 8 in same oxide order
+
+def compute_LSF(mix):
+    CaO = mix[oxide_cols.index("CaO")]
+    SiO2 = mix[oxide_cols.index("SiO2")]
+    Al2O3 = mix[oxide_cols.index("Al2O3")]
+    Fe2O3 = mix[oxide_cols.index("Fe2O3")]
+    denom = (2.8 * SiO2 + 1.18 * Al2O3 + 0.65 * Fe2O3)
+    if denom <= 1e-9:
+        return 1e9
+    return 100.0 * CaO / denom
+
+def compute_SM(mix):
+    SiO2 = mix[oxide_cols.index("SiO2")]
+    Al2O3 = mix[oxide_cols.index("Al2O3")]
+    Fe2O3 = mix[oxide_cols.index("Fe2O3")]
+    denom = (Al2O3 + Fe2O3)
+    if denom <= 1e-9:
+        return 1e9
+    return SiO2 / denom
+
+def compute_AM(mix):
+    Al2O3 = mix[oxide_cols.index("Al2O3")]
+    Fe2O3 = mix[oxide_cols.index("Fe2O3")]
+    if Fe2O3 <= 1e-9:
+        return 1e9
+    return Al2O3 / Fe2O3
+
+# Objective: minimize squared relative errors (normalized)
+def objective(x):
+    mix = mix_oxides(x)
+    lsf = compute_LSF(mix)
+    sm  = compute_SM(mix)
+    am  = compute_AM(mix)
+    # normalized squared error (scale each term so numbers are comparable)
+    e1 = ((lsf - target_lsf) / max(1.0, target_lsf))**2
+    e2 = ((sm  - target_sm)  / max(0.01, target_sm))**2
+    e3 = ((am  - target_am)  / max(0.01, target_am))**2
+    # tiny penalty to prefer less extreme splits (optional)
+    penalty = 1e-6 * np.sum((np.array(x)/100.0)**2)
+    return e1 + e2 + e3 + penalty
+
+# Constraints and bounds
+bounds = [(0.0, 100.0)] * n_materials
+cons = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 100.0},)
+
+st.write("### Run optimizer")
+if st.button("Run Optimization"):
+    with st.spinner("Solving..."):
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'ftol':1e-9, 'maxiter':1000})
+        except Exception as e:
+            st.error(f"Optimizer exception: {e}")
+            st.stop()
+
+    if not res.success:
+        st.error(f"Optimizer failed: {res.message}")
+        # still show best attempt if available
+        x_best = np.clip(res.x if hasattr(res, 'x') else x0, 0, 100)
+    else:
+        x_best = np.clip(res.x, 0, 100)
+
+    # normalize to 100 (numerical)
+    if x_best.sum() == 0:
+        x_norm = x_best
+    else:
+        x_norm = 100.0 * x_best / x_best.sum()
+
+    mix = mix_oxides(x_norm)
+    lsf = compute_LSF(mix)
+    sm = compute_SM(mix)
+    am = compute_AM(mix)
+
+    st.subheader("Optimized proportions (%)")
+    res_df = pd.DataFrame({
+        "Material": materials,
+        "Proportion (%)": np.round(x_norm, 4)
+    })
+    st.dataframe(res_df.set_index("Material"))
+
+    st.subheader("Resulting mix oxide composition (%)")
+    mix_df = pd.DataFrame({
+        "Oxide": oxide_cols,
+        "Mix (%)": np.round(mix, 4)
+    })
+    st.table(mix_df.set_index("Oxide"))
+
+    st.subheader("Achieved metrics")
+    metrics = {
+        "LSF": (lsf, target_lsf, tol_lsf),
+        "SM" : (sm,  target_sm,  tol_sm),
+        "AM" : (am,  target_am,  tol_am)
+    }
+    metrics_df = pd.DataFrame([
+        {"Metric":k, "Achieved":round(v[0],6), "Target":v[1], "Tolerance":v[2],
+         "Within Tolerance": abs(v[0]-v[1]) <= v[2]}
+        for k,v in metrics.items()
+    ]).set_index("Metric")
+    st.table(metrics_df)
+
+    # Quick diagnostic
+    if all(abs(metrics[k][0]-metrics[k][1]) <= metrics[k][2] for k in metrics):
+        st.success("All metrics are within the specified tolerances.")
+    else:
+        st.warning("Some metrics are outside tolerances. Consider adjusting targets or adding/removing materials.")
+
+st.markdown("---")
+st.caption("Note: This is a practical working prototype. For production use you may add data validation, bounds on individual materials, or a multi-objective weighting scheme.")
